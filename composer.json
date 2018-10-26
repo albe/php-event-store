@@ -1,0 +1,27 @@
+{
+    "name": "albe/php-event-store",
+    "type": "library",
+    "require": {
+        "aws/aws-sdk-php": "^3.69",
+        "symfony/serializer": "^4.1",
+        "symfony/property-access": "^4.1"
+    },
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Alexander Berl",
+            "email": "berl@trackmyrace.com"
+        }
+    ],
+    "autoload": {
+        "psr-4": { "Albe\\PhpEventStore\\": "src/" },
+        "exclude-from-classmap": [
+            "/Tests/"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Albe\\PhpEventStore\\Test\\": "tests/"
+        }
+    }
+}
