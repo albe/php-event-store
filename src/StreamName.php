@@ -2,7 +2,7 @@
 
 namespace Albe\PhpEventStore;
 
-class StreamName {
+final class StreamName {
 	private $name;
 
 	/**

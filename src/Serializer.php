@@ -15,6 +15,7 @@ class Serializer implements SerializerInterface {
 	public function __construct() {
 		$this->serializer = new SymfonySerializer(array(new ObjectNormalizer(), new DateTimeNormalizer()));
 	}
+
 	public function serialize($object) {
 		return $this->serializer->normalize($object);
 	}

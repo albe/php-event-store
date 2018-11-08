@@ -2,14 +2,17 @@
 
 namespace Albe\PhpEventStore;
 
+/*
+ * Purpose? StoredEvent(EventInterface)->serialize->deserialize->
+ */
 class StoredEvent implements \JsonSerializable {
 	protected $streamId;
 	protected $streamVersion;
-	protected $committedAt;
-	protected $payload;
 	protected $type;
+	protected $payload;
+	protected $metadata;
+	protected $committedAt;
 	protected $commitId;
-	protected $commitSize;
 	protected $commitIndex;
 
 	public function __construct(array $data, $type = 'array') {
@@ -20,15 +23,16 @@ class StoredEvent implements \JsonSerializable {
 		$this->type = $type;
 	}
 
-	public static function fromClass($eventClass) {
-		$type = new EventType($eventClass);
-		$data = array();
-		$payload = (array)$eventClass;
-		return new static($data,(string)$type);
-	}
-
 	public function jsonSerialize() {
 		return get_object_vars($this);
+	}
+
+	public function getStreamName() {
+		return $this->streamId;
+	}
+
+	public function getStreamVersion() {
+		return $this->streamVersion;
 	}
 
 	public function getType() {
@@ -38,4 +42,21 @@ class StoredEvent implements \JsonSerializable {
 	public function getPayload() {
 		return $this->payload;
 	}
+
+	public function getMetadata() {
+		return $this->metadata;
+	}
+
+	public function getCommitId() {
+		return $this->commitId;
+	}
+
+	public function getCommitIndex() {
+		return $this->commitIndex;
+	}
+
+	public function getCommittedAt() {
+		return $this->committedAt;
+	}
+
 }

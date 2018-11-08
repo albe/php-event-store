@@ -38,8 +38,6 @@ function uuid() {
 	return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($bytes), 4));
 }
 
-
-
 interface EventWithType {
 	public function getType();
 }
@@ -68,6 +66,89 @@ class EventType {
 	public function __toString()
 	{
 		return $this->type;
+	}
+}
+
+abstract class TransactionStatus {
+	const OK = 0;
+	const ACTIVE = 1;
+	const COMMITTED = 2;
+	const ROLLEDBACK = 3;
+}
+
+class Transaction {
+	// Timeout in ms after which a transaction is considered aborted
+	const COMMIT_TIMEOUT = 10 * 1000;
+
+	protected $streamName;
+	protected $commitId;
+	protected $commitSize;
+	protected $commitTs;
+	protected $lastCommitVersion;
+	protected $status;
+
+	protected function __construct($streamName, $commitId, $commitSize, $commitTs, $lastCommitVersion) {
+		$this->streamName = $streamName;
+		$this->commitId = $commitId;
+		$this->commitSize = $commitSize;
+		$this->commitTs = $commitTs;
+		$this->lastCommitVersion = $lastCommitVersion;
+	}
+
+	/**
+	 * @param array $metadata
+	 * @return Transaction
+	 */
+	public static function fromStreamMetadata(array $metadata) {
+		return new static($metadata['streamId'], $metadata['commitId'], $metadata['commitSize'], $metadata['commitTs'], $metadata['commitVersion']);
+	}
+
+	/**
+	 * @param string $streamName
+	 * @param int $commitSize
+	 * @param int $streamVersion
+	 * @return Transaction
+	 */
+	public static function start($streamName, $commitSize, $streamVersion) {
+		$commitId = uuid();
+		$commitTs = static::getTimestamp();
+		return new static($streamName, $commitId, $commitSize, $commitTs, $streamVersion);
+	}
+
+	public static function getTimestamp() {
+		return (int)round(microtime(true) * 1000);
+	}
+
+	/**
+	 * @return bool
+	 */
+	public function isTimedOut() {
+		$now = static::getTimestamp();
+		return ($now - $this->commitTs) > self::COMMIT_TIMEOUT;
+	}
+
+	public function getStreamName() {
+		return $this->streamName;
+	}
+
+	public function getCommitId() {
+		return $this->commitId;
+	}
+
+	public function getCommitSize() {
+		return $this->commitSize;
+	}
+
+	public function getCommitTs() {
+		return $this->commitTs;
+	}
+
+	public function getLastCommitVersion() {
+		return $this->lastCommitVersion;
+	}
+
+	public function getCommitVersion() {
+		return $this->lastCommitVersion + $this->commitSize;
 	}
 }
 
@@ -123,15 +204,15 @@ class EventStore {
 	 * @param string $tableName
 	 * @param array $options
 	 */
-	public function __construct(SerializerInterface $serializer, TypeResolverInterface $typeResolver, $tableName = 'trackmyrace-pay-eventstore', $options = array())
+	public function __construct(SerializerInterface $serializer, TypeResolverInterface $typeResolver, $tableName = 'trackmyrace-pay-eventstore', $options = [])
 	{
-		$this->client = new DynamoDbClient(array_merge(array(
+		$this->client = new DynamoDbClient(array_merge([
 			'region'  => 'eu-central-1',
 			'version' => '2012-08-10'
-		), $options));
+		], $options));
 		$this->marshaler = new Marshaler();
 		$this->tableName = $tableName;
-		$this->commits = array();
+		$this->commits = [];
 		$this->retries = 5;	// Amount of retries on concurrency errors with $expectedVersion = VERSION_ANY
 
 		$this->serializer = $serializer;
@@ -141,61 +222,80 @@ class EventStore {
 
 	public function setup()
 	{
-		$params = array(
-			"TableName" => $this->tableName,
-			"AttributeDefinitions" => array(
-				array(
+		$schema = [
+			"AttributeDefinitions" => [
+				[
 					"AttributeName" => "streamId",
 					"AttributeType" => "S"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "streamVersion",
 					"AttributeType" => "N"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "committedAt",
 					"AttributeType" => "N"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "eventType",
 					"AttributeType" => "S"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "payload",
 					"AttributeType" => "S"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "commitId",
 					"AttributeType" => "S"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "commitSize",
 					"AttributeType" => "N"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "commitIndex",
 					"AttributeType" => "N"
-				)
-			),
-			"KeySchema" => array(
-				array(
+				]
+			],
+			"KeySchema" => [
+				[
 					"AttributeName" => "streamId",
 					"KeyType" => "HASH"
-				),
-				array(
+				],
+				[
 					"AttributeName" => "streamVersion",
 					"KeyType" => "RANGE"
-				)
-			),
-			"ProvisionedThroughput" => array(
-				"ReadCapacityUnits" => 5,
-				"WriteCapacityUnits" => 5,
-			),
-			"StreamSpecification" => array(
+				]
+			],
+			"StreamSpecification" => [
 				"StreamEnabled" => true,
 				"StreamViewType" => "NEW_IMAGE"
-			)
-		);
+			],
+		];
+
+		try {
+			$result = $this->marshaler->unmarshalItem($this->client->describeTable([
+				"TableName" => $this->tableName
+			])->toArray());
+			$currentSchema = array_filter($result['Table'], function($k) {
+				return in_array($k, ['AttributeDefinitions', 'KeySchema', 'StreamSpecification']);
+			}, ARRAY_FILTER_USE_KEY);
+			// TODO: Diff schemas and throw Exception if they differ
+			return true;
+		} catch (\Aws\DynamoDb\Exception\DynamoDbException $e) {
+			// if this exception is thrown, the table doesn't exist
+			if ($e->getAwsErrorCode() !== 'ResourceNotFoundException') {
+				throw $e;
+			}
+		}
+
+		$params = array_merge([
+			"TableName" => $this->tableName,
+			"ProvisionedThroughput" => [
+				"ReadCapacityUnits" => 5,
+				"WriteCapacityUnits" => 5,
+			],
+		], $schema);
 		return $this->client->createTable($params);
 	}
 
@@ -203,21 +303,21 @@ class EventStore {
 	 * @param StreamName $stream
 	 * @param array $metadata Arbitrary stream metadata 
 	 */
-	public function createStream(StreamName $stream, $metadata = array())
+	public function createStream(StreamName $stream, $metadata = [])
 	{
 		unset($metadata['streamId']);
 		unset($metadata['streamVersion']);
 		$committedAt = round(microtime(true) * 1000);
-		$params = array(
+		$params = [
 			"TableName" => $this->tableName,
-			"Item" => $this->marshaler->marshalItem(array_merge(array(
+			"Item" => $this->marshaler->marshalItem(array_merge([
 				"streamId" => (string)$stream,
 				"streamVersion" => 0,
 				"committedAt" => $committedAt,
-			), $metadata)),
+			], $metadata)),
 			// This implicates that the combination of streamId+streamVersion doesn't exist
 			"ConditionExpression" => "attribute_not_exists(streamId)"
-		);
+		];
 
 		try {
 			$this->client->putItem($params);
@@ -233,71 +333,106 @@ class EventStore {
 	 */
 	public function getStreamMetadata(StreamName $stream)
 	{
-		$params = array(
+		$params = [
 			"TableName" => $this->tableName,
 			"ConsistentRead" => true,
-			"Key" => $this->marshaler->marshalItem(array(
+			"Key" => $this->marshaler->marshalItem([
 				"streamId" => (string)$stream,
 				"streamVersion" => 0
-			))
-		);
+			])
+		];
 		$result = $this->client->getItem($params);
 		return $this->marshaler->unmarshalItem($result['Item']);
 	}
 
 	/**
 	 * @param StreamName $stream
-	 * @return int
+	 * @return StreamVersion
 	 */
 	public function getLastStreamVersion(StreamName $stream)
 	{
-		$params = array(
+		$params = [
 			"TableName" => $this->tableName,
 			"Limit" => 1,
 			"ScanIndexForward" => false,
 			"ConsistentRead" => true,
 			"ProjectionExpression" => "streamVersion",
 			"KeyConditionExpression" => "streamId = :streamId",
-			"ExpressionAttributeValues" => $this->marshaler->marshalItem(array(
+			"ExpressionAttributeValues" => $this->marshaler->marshalItem([
 				":streamId" => (string)$stream
-			))
-		);
+			])
+		];
 		$result = $this->client->query($params)['Items'];
 		if (count($result) < 1) {
-			return -1;
+			return StreamVersion::Empty();
 		}
-		return $this->marshaler->unmarshalItem($result[0])['streamVersion'];
+		return new StreamVersion($this->marshaler->unmarshalItem($result[0])['streamVersion']);
 	}
 
-	public function getEventStream(StreamName $stream, $minVersion = 0, $maxVersion = -1)
+	public function getEventStream(StreamName $stream, StreamVersion $minVersion = null, StreamVersion $maxVersion = null)
 	{
-		$params = array(
+		if ($minVersion === null) {
+			$minVersion = StreamVersion::Start();
+		}
+		$params = [
 			"TableName" => $this->tableName,
-			//"IndexName" => "byEventType",
 			"ConsistentRead" => true,
 			"KeyConditionExpression" => "streamId = :streamId AND streamVersion > :minVersion",
-		);
-		if ($maxVersion >= 0) {
-			$params["Limit"] = ($maxVersion - $minVersion) + 1;
+			"ExpressionAttributeValues" => $this->marshaler->marshalItem([
+				":streamId" => (string)$stream,
+				":minVersion" => (int)$minVersion->value()
+			])
+		];
+		if ($maxVersion !== null) {
+			$params["Limit"] = $maxVersion->range($minVersion);
 		}
+
+		$generator = function($params) {
+			while (true) {
+				$result = $this->client->query($params);
+				if (count($result['Items']) < 1) {
+					return;
+				}
+				$events = $this->marshaler->unmarshalItem($result['Items']);
+				foreach ($events as $event) {
+					$eventClass = $this->typeResolver->getEventClass($event['eventType']);
+					$event['payload'] = $this->serializer->deserialize($event['payload'], $eventClass);
+					yield new StoredEvent($event);
+				}
+				if (!isset($result['LastEvaluatedKey'])) {
+					return;
+				}
+				$params['ExclusiveStartKey'] = $result['LastEvaluatedKey'];
+			}
+		};
+		return EventStream::fromIterator($stream, $generator($params));
+/*
+		$deserializer = function($event) use ($serializer, $typeResolver) {
+			$eventClass = $this->typeResolver->getEventClass($event['eventType']);
+			$event['payload'] = $this->serializer->deserialize($event['payload'], $eventClass);
+			return new StoredEvent($event);
+		};
+		$iterator = new QueryBatchIterator($this->client, $params, $deserializer);
+		return EventStream::fromIterator($iterator);
+*/
 	}
 
 	/**
 	 * @param StreamName $stream
-	 * @return array
+	 * @return StoredEvent
 	 */
 	public function getLastEvent(StreamName $stream)
 	{
-		$params = array(
+		$params = [
 			"TableName" => $this->tableName,
 			"Limit" => 1,
 			"ScanIndexForward" => false,
 			"ConsistentRead" => true,
 			"KeyConditionExpression" => "streamId = :streamId",
-			"ExpressionAttributeValues" => $this->marshaler->marshalItem(array(
+			"ExpressionAttributeValues" => $this->marshaler->marshalItem([
 				":streamId" => (string)$stream
-			))
-		);
+			])
+		];
 		$result = $this->client->query($params)['Items'];
 		if (count($result) < 1) {
 			return null;
@@ -314,24 +449,31 @@ class EventStore {
 	/**
 	 * @param StreamName $stream
 	 * @param array $events
-	 * @param int $expectedVersion
+	 * @param StreamVersion $expectedVersion
 	 * @param array $metadata
 	 */
-	public function commit(StreamName $stream, array $events, $expectedVersion = self::VERSION_ANY, $metadata = array())
+	public function commit(StreamName $stream, array $events, StreamVersion $expectedVersion = null, $metadata = [])
 	{
-		$params = array(
+		$params = [
 			"TableName" => $this->tableName,
-			"Item" => array(),
+			"Item" => [],
 			// This implicates that the combination of streamId+streamVersion doesn't exist
 			"ConditionExpression" => "attribute_not_exists(streamId)"
-		);
+		];
 
-		if (!is_int($expectedVersion)) {
-			$expectedVersion = self::VERSION_ANY;
+		if ($expectedVersion === null) {
+			$expectedVersion = StreamVersion::Any();
 		}
 
-		$streamVersion = $expectedVersion >= 0 ? $expectedVersion : $this->getLastStreamVersion($stream);
+		if ($expectedVersion->isEmpty()) {
+			$streamVersion = 0;
+		} elseif ($expectedVersion->isAny()) {
+			$streamVersion = $this->getLastStreamVersion($stream);
+		} else {
+			$streamVersion = $expectedVersion->value();
+		}
 
+		// Avoid overwriting important generated event metadata
 		unset($metadata['streamId']);
 		unset($metadata['streamVersion']);
 		unset($metadata['payload']);
@@ -340,89 +482,123 @@ class EventStore {
 		unset($metadata['commitIndex']);
 
 		$commitSize = count($events);
-		$commitId = uuid(); // This only needs to be unique within the stream
-
-		$this->startTransaction((string)$stream, $streamVersion, $commitId);
+		$transaction = Transaction::start((string)$stream, count($events), $streamVersion);
+		$result = $this->startTransaction($transaction);
+		if ($result === false) {
+			// Transaction failed because another transaction is active. Retry later.
+			if ($this->commitAttempts >= Transaction::MAX_RETRIES) {
+				$status = $this->checkTransactionStatus($stream);
+			}
+			$delay = \Aws\RetryMiddleware::exponentialDelay($this->commitAttempts);
+			usleep($delay);
+			$this->commit($stream, $events, $expectedVersion, $metadata);
+			return;
+		}
 		for ($commitIndex = 1; $commitIndex <= $commitSize; $commitIndex++) {
-			$committedAt = round(microtime(true) * 1000);
+			$committedAt = Transaction::getTimestamp();
 			$streamVersion++;
 			$event = $events[$commitIndex - 1];
 			$eventType = $this->typeResolver->getEventType($event);
 			$payload = $this->serializer->serialize($event);
-			$params['Item'] = $this->marshaler->marshalItem(array_merge(array(
+			$params['Item'] = $this->marshaler->marshalItem([
 				"streamId" => (string)$stream,
 				"streamVersion" => $streamVersion,
 				"eventType" => $eventType,
 				"payload" => $payload,
-				"commitId" => $commitId,
-				"commitSize" => $commitSize,
+				"metadata" => $metadata,
+				"commitId" => $transaction->getCommitId(),
+				//"commitSize" => $commitSize,
 				"commitIndex" => $commitIndex,
 				"committedAt" => $committedAt,
-			), $metadata));
+			]);
 
 			try {
 				$this->client->putItem($params);
 			} catch (\Aws\DynamoDb\Exception\DynamoDbException $e) {
-				$this->rollBack($streamVersion);
+				$this->rollBack($transaction);
 				if ($e->getAwsErrorCode() !== 'ConditionalCheckFailedException') {
 					throw $e;
 				}
 
-				if ($expectedVersion !== self::VERSION_ANY) {
+				if (!$expectedVersion->isAny()) {
 					throw new OptimisticConcurrencyException('Stream "' . $stream . '" at version ' . $streamVersion . ' already exists.');
 				}
 
 				// Exponential backoff with jitter when another process added a commit beforehand
-				$delay = \Aws\RetryMiddleware::exponentialDelay(count($this->commits));
+				$delay = \Aws\RetryMiddleware::exponentialDelay($this->commitAttempts);
 				usleep($delay);
 				$this->commit($stream, $events, $expectedVersion, $metadata);
-				break;
+				return;
 			}
 		}
-		$this->commitTransaction();
+		$this->commitTransaction($transaction);
 	}
 
-	/**
-	 * @param string $stream
-	 * @param int $streamVersion
-	 * @param string $commitId
-	 */
-	private function startTransaction($stream, $streamVersion, $commitId)
+	private function updateStreamMetadata($stream, $updateExpression, $values = [], $conditionExpression = null)
 	{
-		if (count($this->commits) > $this->retries) {
-			throw new \RuntimeException('The event store is overloaded and can not finish the commit.');
+		$params = [
+			"TableName" => $this->tableName,
+			"Key" => $this->marshaler->marshalItem([
+				"streamId" => (string)$stream,
+				"streamVersion" => 0
+			]),
+			"ExpressionAttributeValues" => $this->marshaler->marshalItem($values),
+			"UpdateExpression" => $updateExpression
+		];
+		if ($conditionExpression !== null) {
+			$params['ConditionExpression'] = $conditionExpression;
 		}
-		array_push($this->commits, array($stream, $streamVersion, $commitId));
+
+		try {
+			$this->client->updateItem($params);
+			return true;
+		} catch (\Aws\DynamoDb\Exception\DynamoDbException $e) {
+			if ($e->getAwsErrorCode() !== 'ConditionalCheckFailedException') {
+				throw $e;
+			}
+			return false;
+		}
 	}
 
-	/**
-	 * @param int $until
-	 */
-	private function rollBack($until)
+	private function startTransaction(Transaction $tx)
 	{
-		$lastCommit = array_pop($this->commits);
-		if (!$lastCommit) {
-			throw new \LogicException('Trying to roll back outside of a started transaction.');
+		$this->commitAttempts++;
+		if ($tx->getCommitSize() === 1) {
+			// A single write is always transactional, so nothing to do here
+			return true;
 		}
-
-		list($stream, $streamVersion, $commitId) = $lastCommit;
-		if ($streamVersion >= $until -1) {
-			// Nothing to do. Transaction failed on first item.
-			return;
-		}
-
-		while ($streamVersion < $until) {
-			$params = array(
-				"TableName" => $this->tableName,
-				"Key" => $this->marshaler->marshalItem(array(
-					"streamId" => $stream,
-					"streamVersion" => $streamVersion
-				)),
-				"ConditionExpression" => "attribute_exists(commitId) AND commitId = :commitId",
-				"ExpressionAttributeValues" => array(
-					":commitId" => $commitId
-				)
+		$result = $this->updateStreamMetadata($tx->getStreamName(),
+			"SET commitId = :commitId, commitSize = :commitSize, commitTs = :commitTs",
+			[
+				":lastCommitVersion" => $tx->getLastCommitVersion(),
+				":commitId" => $tx->getCommitId(),
+				":commitSize" => $tx->getCommitSize(),
+				":commitTs" => $tx->getCommitTs()
+			],
+			"attribute_not_exists(commitId) AND commitVersion = :lastCommitVersion"
 			);
+		if ($result === false) {
+			// Another transaction is currently running... retry later please!
+			return false;
+		}
+	}
+
+	private function rollBack(Transaction $tx)
+	{
+		$streamVersion = $tx->getLastCommitVersion() + 1;
+		// DO THE ROLLBACK -> delete all items of the rolled back transaction
+		while ($streamVersion < $tx->getCommitVersion()) {
+			$params = [
+				"TableName" => $this->tableName,
+				"Key" => $this->marshaler->marshalItem([
+					"streamId" => $tx->getStreamName(),
+					"streamVersion" => $streamVersion
+				]),
+				"ConditionExpression" => "attribute_exists(commitId) AND commitId = :commitId",
+				"ExpressionAttributeValues" => [
+					":commitId" => $tx->getCommitId()
+				]
+			];
 			try {
 				$this->client->deleteItem($params);
 				$streamVersion++;
@@ -436,16 +612,58 @@ class EventStore {
 				throw $e;
 			}
 		}
+
+		// Mark the transaction rolled back
+		$result = $this->updateStreamMetadata($tx->getStreamName(),
+			"REMOVE commitId",
+			[
+				":commitId" => $tx->getCommitId()
+			],
+			"attribute_exists(commitId) AND commitId = :commitId"
+		);
+		if ($result === false) {
+			// The transaction is already rolled back or committed. Nothing to do here.
+			return;
+		}
 	}
 
-	/**
-	 * This just removes the current transaction from the stack
-	 */
-	private function commitTransaction()
+	private function commitTransaction(Transaction $transaction)
 	{
-		$lastCommit = array_pop($this->commits);
-		if (!$lastCommit) {
-			throw new \LogicException('Trying to commit outside of a started transaction.');
+		$this->commitAttempts = 0;
+		$result = $this->updateStreamMetadata($transaction->getStreamName(),
+			"REMOVE commitId SET commitVersion = :commitVersion",
+			[
+				":commitVersion" => $transaction->getCommitVersion(),
+				":commitId" => $transaction->getCommitId()
+			],
+			"commitId = :commitId"
+		);
+		if ($result === false) {
+			// The commit failed, because the transaction was aborted beforehand.
+			return false;
 		}
+		return true;
+	}
+
+	private function checkTransactionStatus($stream)
+	{
+		$streamMetadata = $this->getStreamMetadata($stream);
+		if (isset($streamMetadata['commitId'])) {
+			// A transaction is running...
+			$transaction = Transaction::fromStreamMetadata($streamMetadata);
+			if ($transaction->isTimedOut()) {
+				$lastEvent = $this->getLastEvent($stream);
+				if ($lastEvent->getCommitIndex() === $transaction->getCommitSize()) {
+					// The previous transaction was fully written, but not committed. Commit it now.
+					$this->commitTransaction($transaction);
+					return TransactionStatus::COMMITTED;
+				}
+				// The transaction timed out unfinished. We need to roll it back!
+				$this->rollBack($transaction);
+				return TransactionStatus::ROLLEDBACK;
+			}
+			return TransactionStatus::ACTIVE;
+		}
+		return TransactionStatus::OK;
 	}
 }
